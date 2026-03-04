@@ -1,5 +1,92 @@
 # StateFlow Testing: Conflation, Relay Coroutines & Dispatcher Mechanics
 
+## How `StandardTestDispatcher` and `UnconfinedTestDispatcher` Work — and How They Differ From Real Life
+
+Every behavior described in this report ultimately traces back to how these two dispatchers schedule coroutine continuations. Understanding them at a mechanical level is the foundation for understanding everything else.
+
+---
+
+### What a dispatcher actually does
+
+A dispatcher answers one question: **when and on which thread does a resumed coroutine continuation run?**
+
+When a coroutine is suspended and then resumed (e.g., a `StateFlow` update marks its collector's slot as PENDING), the coroutine's continuation is handed to the dispatcher. The dispatcher decides whether to run it immediately, queue it, or schedule it for later.
+
+---
+
+### `StandardTestDispatcher` — the lazy queue
+
+**Mechanism:** Every continuation is placed into a **FIFO task queue** managed by a `TestCoroutineScheduler`. Nothing in the queue runs automatically. The queue only drains when something explicitly advances the scheduler:
+- A `delay()` call parks the current coroutine and the scheduler picks the next task
+- `advanceUntilIdle()` drains all currently queued tasks
+- `runCurrent()` runs only the tasks queued at the current virtual time
+- A suspension in the test body lets the scheduler pick the next queued task
+
+**Key property:** Synchronous code within a coroutine runs completely uninterrupted. The scheduler cannot inject a task between two consecutive non-suspending lines. A coroutine runs until it hits a suspension point, then — and only then — does the scheduler pick the next queued task.
+
+**Virtual time:** `StandardTestDispatcher` operates on **virtual time**. `delay(1000)` does not wait 1 real second — it parks the coroutine at virtual timestamp T+1000ms. `advanceUntilIdle()` jumps virtual time forward to drain all parked tasks. This makes tests fast and deterministic.
+
+**Real-world equivalent:** This is how `Dispatchers.Main` behaves on Android in production. The main thread runs a `Looper` message queue — it processes one `Message`/`Runnable` at a time, draining the queue cooperatively. A `Handler.post { ... }` enqueues a task; it doesn't preempt what's currently running. `StandardTestDispatcher` is a faithful model of this: cooperative, queue-based, non-preemptive.
+
+**What it models accurately:**
+- The ordering guarantees of real coroutine execution on `Dispatchers.Main`
+- The fact that `launch { }` does not start immediately — it queues
+- The cooperative nature of coroutine scheduling
+
+**What it does NOT model:**
+- Parallelism (everything is sequential on one virtual thread)
+- Real elapsed time (virtual time is instantaneous)
+
+---
+
+### `UnconfinedTestDispatcher` — the eager inline runner
+
+**Mechanism:** When a continuation is resumed, it is dispatched **immediately and inline** on the current thread — before returning control to the caller. There is no queue. The resumed coroutine runs right now, to its next suspension point, and only then returns.
+
+**Key property:** When `_uiState.update(...)` marks a collector's slot as PENDING and the collector is on `UnconfinedTestDispatcher`, the collector runs **synchronously inside the `update` call** — before `update` returns to the line of code that called it. This is what allows catching every intermediate `StateFlow` emission.
+
+**Virtual time:** `UnconfinedTestDispatcher` still participates in the same `TestCoroutineScheduler` as `StandardTestDispatcher` when they share a scheduler instance. `delay()` still uses virtual time — only the dispatch behaviour (queue vs inline) differs.
+
+**Real-world equivalent:** This resembles `Dispatchers.Unconfined` in production — a dispatcher that runs the coroutine on whichever thread resumed it, without re-dispatching. In practice, production code rarely uses `Dispatchers.Unconfined` intentionally. `UnconfinedTestDispatcher` is a **test-only construct** that has no direct production analogue at the architectural level — it exists purely to make collectors faster than producers in tests.
+
+**What it models accurately:**
+- A collector that is infinitely fast relative to its producer
+- The theoretical maximum observability of a `StateFlow`
+
+**What it does NOT model:**
+- Real Android main thread scheduling
+- Real-world dispatcher behavior for `viewModelScope`
+
+---
+
+### Side-by-side comparison
+
+| Property | `StandardTestDispatcher` | `UnconfinedTestDispatcher` |
+|---|---|---|
+| Continuation dispatch | Queued, runs at next drain point | Inline, runs immediately |
+| Synchronous code interrupted? | ❌ Never | ❌ Never (only suspension points matter) |
+| Virtual time used? | ✅ Yes | ✅ Yes (if sharing scheduler) |
+| `launch { }` starts immediately? | ❌ No — queued | ✅ Yes — runs eagerly |
+| Real-world analogue | `Dispatchers.Main` (Looper queue) | `Dispatchers.Unconfined` (no dispatch) |
+| Used for | Producing coroutines (viewModelScope) | Collecting coroutines (relay, Turbine) |
+| Risk | Conflation between suspension points | Unexpected execution order in complex graphs |
+
+---
+
+### Why the combination matters for `StateFlow` testing
+
+The entire problem space in this report exists because of one interaction:
+
+> `StateFlow` conflates by design — its slot is binary (NONE/PENDING). If a collector's slot is already PENDING when a new value is written, the new value silently overwrites the old one in place. The collector will read only the latest value when it eventually runs.
+
+Under `StandardTestDispatcher`, a collector's slot can stay PENDING across many updates — because the collector is queued and doesn't run until the scheduler drains. Every update that fires while the slot is PENDING is lost except the last.
+
+Under `UnconfinedTestDispatcher`, the collector runs inline immediately after each update — the slot resets to NONE before the next update fires. Conflation never gets a chance to happen.
+
+This is why the winning combination is always **Standard producer + Unconfined collector** — and why every case in this report is ultimately a variation of whether that combination is in place at the `_uiState` layer.
+
+---
+
 ## Project Context
 
 - **ViewModel**: `CounterViewModel` using `stateIn` with `SharingStarted.WhileSubscribed(5000)` and `onStart { loadInitialCounter() }`
@@ -511,6 +598,54 @@ Three reasons compound here:
 ### Key insight: `onStart` mutation creates a hidden state dependency
 
 When you mutate `_uiState` inside `onStart`, the `initialValue` passed to `stateIn` and the actual first value the relay forwards **will diverge** — always. The subscriber sees a brief window (from subscription until `onStart` completes) where `uiState.value` reports `initialValue` while `_uiState` has already moved on. This is not a test artifact — it is the same in production.
+
+### Note: what the first `awaitItem()` returns is strictly determined by suspension points in `onStart`
+
+This is **not flaky** — it is structurally guaranteed in both directions:
+
+**If `onStart` has a suspension point BEFORE the `_uiState` mutation:**
+
+```
+Turbine subscribes
+  → stateIn writes initialValue=(count=0) into sharedState
+  → relay enters onStart → hits suspension point → PARKS
+  → sharedState is still (count=0) — nothing has touched it
+
+test body calls awaitItem()
+  → sharedState = (count=0) ← always reads this
+  → relay is parked — it physically cannot write to sharedState yet
+
+virtual time advances past suspension
+  → onStart resumes → mutation fires → relay subscribes → sharedState updated
+  → next awaitItem() returns the mutated value
+```
+
+The suspension point is a **hard stop** — not a race condition. The relay cannot proceed until virtual time is explicitly advanced by the test. `awaitItem()` always wins because the relay is not competing; it is completely stopped.
+
+**If `onStart` has NO suspension point (synchronous `onStart`):**
+
+```
+Turbine subscribes
+  → stateIn writes initialValue=(count=0) into sharedState
+  → relay enters onStart → mutation fires synchronously
+  → relay subscribes → _uiState replays mutated value → sharedState overwritten
+  → ALL OF THIS completes before awaitItem() is ever called
+
+test body calls awaitItem()
+  → sharedState = mutated value ← always reads this
+  → (count=0) was written and immediately overwritten in one uninterrupted block
+```
+
+The `initialValue` is overwritten before the test body can read it.
+
+**The strict rule:**
+
+| `onStart` before mutation | First `awaitItem()` returns | Deterministic? |
+|---|---|---|
+| Has suspension point | `initialValue` (non-mutated) | ✅ Always |
+| No suspension point | Mutated value | ✅ Always |
+
+Neither case involves scheduler timing or ordering uncertainty. The suspension point alone determines the outcome — making this behavior safe to assert on in tests without fear of flakiness.
 
 ### Disclaimer: behavior changes entirely when `onStart` has no suspension point
 
