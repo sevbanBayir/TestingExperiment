@@ -1,22 +1,8 @@
 # Testing StateFlows Built with `stateIn`: The Conflation Problem Nobody Warns You About
 
-*[PERSONAL INTRO — share what led you to discover this issue, what you were building, what went wrong in your tests]*
-
----
-
-## The Setup
-
-I had a ViewModel that looked roughly like this:
+We were [told](https://proandroiddev.com/loading-initial-data-part-2-clear-all-your-doubts-0f621bfd06a0) to load initial data from network like this :
 
 ```kotlin
-class CounterViewModel(
-    sharingDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate
-) : ViewModel() {
-
-    private val sharingScope = CoroutineScope(
-        viewModelScope.coroutineContext + sharingDispatcher
-    )
-
     private val _uiState = MutableStateFlow(CounterUiState())
     val uiState: StateFlow<CounterUiState> = _uiState
         .onStart { loadInitialCounter() }
@@ -25,6 +11,34 @@ class CounterViewModel(
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = _uiState.value
         )
+```
+
+But this is problematic when it comes to testing. Normally we would do smt like this to define the top level state of the related screen and update it when necessary :
+
+```kotlin
+    private val _uiState = MutableStateFlow(CounterUiState())
+    val uiState: StateFlow<CounterUiState> = _uiState.asStateFlow()
+        )
+```
+
+This is a pure backing property and does not have any side effects. The former one on the other hand, introduces an implicit boundary to a new coroutine and this new coroutine (i will call it the "relay coroutine" from now on)
+does not actually subscribe to the upstream flow which is the actual source of truth for our state emissions until the onStart function really finishes. This causes us to miss intermediate state updates to _uiState and effectively lower confidence in our tests. Yes, we don't really need all the emissions all the time but on very specific and vital business logics we definetely do. In this article I will try to reduce (but not completely take it down unfortunately) this side effects and try to explain what actually happens under the hood. So, in some sense this should give you more confidence than not knowing anything and blindly asserting on only the final state of the StateFlows.
+
+---
+
+## The Setup
+
+This is a toy ViewModel from the reproduction repo that simulates frequent updates to state flows and how to test them.
+
+First things first, even without all the drama above, testing stateflows is require special setup and attention as Marton Braun states in his article very clearly: Collector of the stateflow must be faster than the producer. Which means using UnconfinedDispatcher when collecting in our tests and the viewmodel that sends updates must do this in a slower StandardTestDispatcher.
+
+To be able to test this viewmodel: 
+
+```kotlin
+class CounterViewModel() : ViewModel() {
+
+    private val _uiState = MutableStateFlow(CounterUiState())
+    val uiState: StateFlow<CounterUiState> = _uiState.asStateFlow()
 
     fun incrementAsync() {
         viewModelScope.launch {
@@ -35,57 +49,97 @@ class CounterViewModel(
             _uiState.update { it.copy(count = it.count + 1, isLoading = false) } // ④
         }
     }
+}
+```
+Our minimal setup would be like this : 
+
+- Set main dispatcher with a JUnit5 extension:
+
+```kotlin
+@OptIn(ExperimentalCoroutinesApi::class)
+class MainDispatcherExtension(
+    val testDispatcher: TestDispatcher = StandardTestDispatcher()
+) : BeforeEachCallback, AfterEachCallback {
+
+    override fun beforeEach(context: ExtensionContext?) {
+        Dispatchers.setMain(testDispatcher)
+    }
+
+    override fun afterEach(context: ExtensionContext?) {
+        Dispatchers.resetMain()
+    }
+}
+
+```
+Since this will be the producer of the updates (viewmodelScope == Dispatchers.Main.immediate) we set it to StandardTestDispatcher().
+
+- Collect with a faster coroutine context which is the Turbine in our case. Turbine uses UnconfinedTestDispatcher when it is called from inside a runTest block:
+
+With these setups this test case passes: 
+
+```kotlin
+@Test
+fun `Case 4 - asStateFlow - all 5 emissions observed`() = runTest {
+    val viewModel = CounterViewModel()
+
+    viewModel.uiState.test {
+        assertThat(awaitItem()).isEqualTo(CounterUiState()) 
+
+        viewModel.incrementAsync()
+
+        
+        assertThat(awaitItem().isLoading).isTrue()   
+        assertThat(awaitItem().isLoading).isFalse() 
+        assertThat(awaitItem().isLoading).isTrue()   
+
+        val done = awaitItem()                       
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(1)          
+    }
+}
+```
+Which means you can catch every single emission as you expected and which is normal and intuitive.
+At this point if you don't need any fine-grained assertion you'd simply go assert on .value property of the StateFlow and if you do need fine-grained access to emission they are simply there deterministically.
+
+---
+
+---
+
+## When Things Get Messed Up
+
+### The Setup
+
+Here is the same viewmodel but let's go try to load initial data as Skydoves' article suggests:
+
+
+```kotlin
+class CounterViewModel() : ViewModel() {
+
+    private val _uiState = MutableStateFlow(CounterUiState())
+    val uiState: StateFlow<CounterUiState> = _uiState
+        .onStart { loadInitialCounter() }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = _uiState.value
+        )
+
+    fun incrementAsync() {
+        // ... Same content as before.
+    }
 
     suspend fun loadInitialCounter() {
         delay(1.seconds)
         // loads initial data
+        // Be careful, we are not yet making updates here
     }
 }
 ```
 
-*[YOUR COMMENT — why you chose `stateIn` + `onStart` for initial loading, what problem it was solving]*
+### The Shocking Truth
 
----
-
-## What I Expected to Test
-
-Including the initial state, `incrementAsync` should produce 5 distinct emissions:
-
-| # | Value |
-|---|---|
-| 0 | `(count=0, isLoading=false)` — initial |
-| 1 | `(count=0, isLoading=true)` — loading starts |
-| 2 | `(count=0, isLoading=false)` — briefly not loading |
-| 3 | `(count=0, isLoading=true)` — loading again |
-| 4 | `(count=1, isLoading=false)` — done |
-
-*[YOUR COMMENT — why you wanted to assert on all intermediate states, what business logic they represented]*
-
----
-
-## What I Actually Got
-
-With the standard test setup using `MainDispatcherExtension` and `StandardTestDispatcher`:
-
-```kotlin
-@ExtendWith(MainDispatcherExtension::class)
-class CounterViewModelTest {
-    @Test
-    fun `incrementAsync shows loading then increments`() = runTest {
-        viewModel.uiState.test {
-            assertThat(awaitItem().count).isEqualTo(0)   // ✅ passes
-
-            viewModel.incrementAsync()
-
-            val loading = awaitItem()
-            assertThat(loading.isLoading).isTrue()       // ❌ times out / wrong value
-            // ...
-        }
-    }
-}
-```
-
-**Observed: only 2 of 5 emissions.**
+With this simple change, the number of emissions you can catch is down to 2. You can only catch the first and last emissions. 
+Here you can see the missing ones: 
 
 | # | Emission | Observed? |
 |---|---|---|
@@ -95,44 +149,23 @@ class CounterViewModelTest {
 | 3 | `(count=0, isLoading=true)` | ❌ |
 | 4 | `(count=1, isLoading=false)` | ✅ |
 
-*[YOUR COMMENT — what you thought initially, how confusing/frustrating this was, your first assumptions about what was wrong]*
-
----
-
-## The First Clue: Swapping `stateIn` for `asStateFlow()`
-
-Out of curiosity I tried replacing `stateIn` with a simple `asStateFlow()` (moving `loadInitialCounter` to `init {}`):
-
-```kotlin
-private val _uiState = MutableStateFlow(CounterUiState())
-val uiState = _uiState.asStateFlow()
-
-init {
-    viewModelScope.launch { loadInitialCounter() }
-}
-```
-
-All 5 emissions became observable. Same test, same dispatcher setup.
-
-*[YOUR COMMENT — your reaction to this, what it told you, whether this was a viable option for your real code]*
-
----
-
 ## Understanding Why: Two Dispatchers, One Rule
 
 Before getting into what `stateIn` specifically does, it is worth understanding the two test dispatchers involved, because the entire problem comes down to their interaction.
 
-### `StandardTestDispatcher` — the lazy queue
+### `StandardTestDispatcher` the lazy queue
 
 Every coroutine continuation is placed into a FIFO task queue. Nothing runs until the scheduler is explicitly advanced — by a `delay()`, `advanceUntilIdle()`, or a suspension in the test body. A coroutine runs completely uninterrupted until it hits a suspension point; the scheduler cannot insert anything between two non-suspending lines.
 
 This faithfully models how `Dispatchers.Main` works on Android in production: the Looper processes one message at a time, cooperatively. `launch { }` posts a message — it does not preempt what is running.
 
-### `UnconfinedTestDispatcher` — the eager inline runner
+### `UnconfinedTestDispatcher` the eager inline runner
 
 When a coroutine is resumed, it runs **immediately and inline** on the current thread before returning to the caller. There is no queue. This is a test-only construct with no direct real-world analogue — it exists purely to make a collector faster than its producer.
 
 ### The fundamental rule
+
+As I stated at the beginning of this article : 
 
 > **The only way to avoid `StateFlow` conflation in tests is: collector on `UnconfinedTestDispatcher`, producer on `StandardTestDispatcher`.**
 
@@ -151,8 +184,6 @@ If the slot is already `PENDING` when a new value is written, the new value sile
 
 Under `StandardTestDispatcher`, the slot stays PENDING across multiple rapid updates because the collector is queued and cannot run between non-suspending lines. Under `UnconfinedTestDispatcher`, the collector runs inline after every update, resetting the slot to NONE before the next update fires.
 
-*[YOUR COMMENT — whether this rule was intuitive to you, how it changed how you think about coroutine testing]*
-
 ---
 
 ## What `stateIn` Actually Does
@@ -167,7 +198,7 @@ val uiState = _uiState
     .stateIn(scope = someScope, ...)
 ```
 
-`stateIn` silently creates a **relay coroutine** inside `someScope`. Its job is to collect from `_uiState.onStart { ... }` and forward every value into an internal `sharedState: MutableStateFlow<T>`. Collectors like Turbine subscribe to `sharedState` — not to `_uiState` directly.
+`stateIn` silently creates a **relay coroutine** inside `someScope`. Its job is to collect from `_uiState.onStart { ... }` and forward every value into an internal `sharedState: MutableStateFlow<T>`. Collectors like Turbine subscribe to `sharedState` not to `_uiState` directly.
 
 ```
 _uiState  ←── incrementAsync
@@ -179,7 +210,7 @@ sharedState (internal)
 [Turbine]
 ```
 
-With `asStateFlow()` there is no relay:
+With `asStateFlow()` there is no relay coroutine:
 
 ```
 _uiState  ←── incrementAsync
@@ -188,8 +219,6 @@ _uiState  ←── incrementAsync
 ```
 
 The relay introduces an **extra conflation point**. Even if Turbine is Unconfined, it never sees an intermediate value that the relay already conflated before forwarding to `sharedState`.
-
-*[YOUR COMMENT — your reaction when you realised this, whether the "invisible relay" concept surprised you]*
 
 ---
 
@@ -224,8 +253,6 @@ delay(1000)                                      // ← first suspension point
 
 When ① fires, the relay's slot flips to PENDING and the relay is queued. When ② fires, the slot is already PENDING — the value is overwritten, nothing new is enqueued. Same for ③. When `delay(1000)` finally suspends `incrementAsync`, the relay runs for the first time and reads `_uiState.value` — which is only ③'s value. Updates ① and ② are gone.
 
-*[YOUR COMMENT — whether this "invisible history loss" concerned you for production behaviour, or only for testing]*
-
 ---
 
 ## Attempts to Fix It
@@ -235,8 +262,6 @@ When ① fires, the relay's slot flips to PENDING and the relay is queued. When 
 If the relay is Unconfined, it should dispatch inline between each update, right?
 
 The problem: both the relay and `incrementAsync` share `viewModelScope`. Changing `setMain` to `UnconfinedTestDispatcher` makes **both** Unconfined. When `incrementAsync` (Unconfined) holds the thread during `①②③`, the relay (also Unconfined) cannot preempt it. **Unconfined/Unconfined is a losing combination.**
-
-*[YOUR COMMENT — whether you tried this, how long it took to realize it wouldn't work]*
 
 ### Attempt 2: Scope Injection
 
@@ -317,7 +342,7 @@ _uiState.update { it.copy(isLoading = true) }
 | `yield()` | ❌ | ❌ — reshuffles queue, order not guaranteed |
 | `delay()` | ✅ | ✅ — parks producer, relay has exclusive window |
 
-*[YOUR COMMENT — whether adding `delay()` to production code for testability felt like a good or bad trade-off]*
+These two last attempts will never make in to production since we must strictly avoid changing prod code in favor of testing. Plus, they may not  be ever needed. 
 
 ---
 

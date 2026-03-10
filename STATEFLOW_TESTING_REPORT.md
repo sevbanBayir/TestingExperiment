@@ -273,6 +273,44 @@ Scheduler drains → incrementAsync coroutine starts running
 
 The relay conflates all three synchronous updates to one before Turbine ever receives them. Even though Turbine is Unconfined, it never sees the intermediate values because they are lost at the relay layer.
 
+### Test Code
+
+> ⚠️ **Requires ViewModel change:** Remove `sharingScope` and pass `viewModelScope` directly to `stateIn`. With the current `sharingScope` architecture the relay gets its own independent queue and you get Case 3 behavior (3/5) instead of this case (2/5).
+>
+> ⚠️ **Requires:** `delay(1.seconds)` active (uncommented) in `loadInitialCounter()`.
+
+```kotlin
+// ViewModel — temporary change needed:
+// val uiState = _uiState
+//     .onStart { loadInitialCounter() }
+//     .stateIn(scope = viewModelScope, ...)   // ← viewModelScope, NOT sharingScope
+
+@Test
+fun `Case 1 - stateIn viewModelScope Standard - 2 of 5 observed`() = runTest {
+    // Relay and incrementAsync share viewModelScope → both Standard → losing combination.
+    // The relay sits behind incrementAsync in the same FIFO queue and can never run
+    // between ①②③ because they contain no suspension points.
+    val viewModel = CounterViewModel() // default Dispatchers.Main.immediate → setMain(Standard)
+
+    viewModel.uiState.test {
+        assertThat(awaitItem()).isEqualTo(CounterUiState()) // initial (count=0, isLoading=false)
+
+        viewModel.incrementAsync()
+
+        // ①②③ are one uninterrupted synchronous block. Relay slot stays PENDING throughout.
+        // After delay(1000) the relay wakes, reads whichever value _uiState holds at that
+        // moment, and forwards it — all earlier intermediate values are already gone.
+        // ④ then fires and also propagates.
+        // Only ONE relay-forwarded value from the ①②③ block is visible before ④.
+        val done = awaitItem()
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(1) // count=0+1=1
+
+        cancelAndIgnoreRemainingEvents() // any intermediate relay-flush from ③ is ignored
+    }
+}
+```
+
 ---
 
 ## Case 2: `setMain(UnconfinedTestDispatcher)` — Considered but Broken
@@ -292,6 +330,46 @@ Both share `viewModelScope` → both get `UnconfinedTestDispatcher` via `setMain
 When `incrementAsync` (Unconfined) holds the thread during `①②③`, the relay (also Unconfined) **cannot preempt a currently-executing Unconfined coroutine**. It queues up and only runs after `incrementAsync` suspends at `delay`. By then, all three values have been written and `_uiState` holds only ③'s value.
 
 **Unconfined/Unconfined = losing combination.** Making both Unconfined does not help.
+
+### Test Code
+
+> ⚠️ **Requires ViewModel change:** Remove `sharingScope` and use `viewModelScope` directly in `stateIn` so the relay inherits the Unconfined dispatcher from `setMain`.
+>
+> ⚠️ **Requires:** `delay(1.seconds)` active in `loadInitialCounter()`.
+
+```kotlin
+@OptIn(ExperimentalCoroutinesApi::class)
+class Case2BrokenTest {
+
+    // setMain(Unconfined) → viewModelScope (and anything inheriting from it) becomes Unconfined.
+    @JvmField
+    @RegisterExtension
+    val mainDispatcherExtension = MainDispatcherExtension(UnconfinedTestDispatcher())
+
+    @Test
+    fun `Case 2 - setMain Unconfined - still fails despite Unconfined relay`() = runTest {
+        // ViewModel must use viewModelScope (no sharingScope) so relay is also Unconfined.
+        // Both relay and incrementAsync end up on UnconfinedTestDispatcher → losing combination.
+        // incrementAsync holds the thread during ①②③. The relay (also Unconfined) cannot
+        // preempt a currently-running Unconfined coroutine — it must wait for a suspension point.
+        val viewModel = CounterViewModel()
+
+        viewModel.uiState.test {
+            assertThat(awaitItem()).isEqualTo(CounterUiState()) // initial (count=0, isLoading=false)
+
+            viewModel.incrementAsync()
+
+            // Still conflated — Unconfined/Unconfined is NOT the winning combination.
+            // incrementAsync holds the thread; relay can only run after delay(1000).
+            val done = awaitItem()
+            assertThat(done.isLoading).isFalse()
+            assertThat(done.count).isEqualTo(1)
+
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+}
+```
 
 ---
 
@@ -365,6 +443,43 @@ delay(1000)  // ← FIRST suspension point
 
 No coroutine — regardless of scope or dispatcher — can be dispatched between lines that contain no suspension points. The relay's slot is marked `PENDING` on update ①, stays `PENDING` through ② and ③, and only drains after `delay` creates a suspension. At that point, the relay reads `_uiState.value` which holds only ③'s value. Updates ① and ② are gone.
 
+### Test Code
+
+> **Requires:** `delay(1.seconds)` commented out in `loadInitialCounter()` (current code state).
+> With `delay` commented out `loadInitialCounter` runs synchronously — you will see an extra
+> emission from initialization before calling `incrementAsync`, but the core conflation behaviour
+> of ①②③ is identical.
+
+```kotlin
+@Test
+fun `Case 3 - sharingScope Standard - incrementAsync emits loading then done, not all intermediates`() = runTest {
+    // Independent sharingScope but still Standard/Standard for (_uiState → relay) pairing.
+    // ①②③ form an uninterrupted synchronous block; relay conflates them all to one emission.
+    val viewModel = CounterViewModel(
+        sharingDispatcher = StandardTestDispatcher(mainDispatcherExtension.testDispatcher.scheduler)
+    )
+
+    viewModel.uiState.test {
+        assertThat(awaitItem().count).isEqualTo(0) // stateIn's static initialValue
+        assertThat(awaitItem().count).isEqualTo(1) // onStart's loadInitialCounter (sync increment)
+
+        viewModel.incrementAsync()
+
+        // ①②③ are one uninterrupted block → relay reads only ③'s value after delay(1000).
+        // ① (isLoading=true) and ② (isLoading=false) are lost to conflation at the relay layer.
+        val loading = awaitItem()                  // relay's one flush for the whole ①②③ block
+        assertThat(loading.isLoading).isTrue()     // ③'s value survived; ① and ② did not
+        assertThat(loading.count).isEqualTo(1)     // count=1 from onStart
+
+        val done = awaitItem()                     // ④ after delay(1000)
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(2)        // count was 1 → 1+1=2
+
+        cancelAndIgnoreRemainingEvents()           // ② (isLoading=false) never reached Turbine
+    }
+}
+```
+
 ---
 
 ## Case 4: `asStateFlow()` — All 5 Emissions Observed
@@ -425,6 +540,45 @@ Execution trace:
 ```
 
 Because Turbine dispatches inline between each update, the value is read **before** `incrementAsync` reaches the next update line. No value is ever overwritten from Turbine's perspective.
+
+### Test Code
+
+> ⚠️ **Requires ViewModel change:** Replace `val uiState = _uiState.onStart{...}.stateIn(...)` with
+> `val uiState = _uiState.asStateFlow()` and move `loadInitialCounter()` to `init { viewModelScope.launch { loadInitialCounter() } }`.
+>
+> With `asStateFlow()` and `delay(1.seconds)` in `loadInitialCounter`, the initial count is `0`
+> and the first `awaitItem()` returns `CounterUiState()` before `loadInitialCounter` fires.
+
+```kotlin
+// ViewModel — required changes:
+// private val _uiState = MutableStateFlow(CounterUiState())
+// val uiState: StateFlow<CounterUiState> = _uiState.asStateFlow()   // ← no relay
+// init { viewModelScope.launch { loadInitialCounter() } }            // ← load in init block
+
+@Test
+fun `Case 4 - asStateFlow - all 5 emissions observed`() = runTest {
+    // Turbine subscribes directly to _uiState — no relay coroutine in the way.
+    // incrementAsync (viewModelScope) = Standard producer.
+    // Turbine (runTest internal) = Unconfined collector.
+    // Standard/Unconfined = winning combination → every StateFlow update runs Turbine inline.
+    val viewModel = CounterViewModel()
+
+    viewModel.uiState.test {
+        assertThat(awaitItem()).isEqualTo(CounterUiState()) // initial (count=0, isLoading=false)
+
+        viewModel.incrementAsync()
+
+        // Each update runs Turbine inline before incrementAsync proceeds to the next line.
+        assertThat(awaitItem().isLoading).isTrue()   // ① (count=0, isLoading=true)
+        assertThat(awaitItem().isLoading).isFalse()  // ② (count=0, isLoading=false)
+        assertThat(awaitItem().isLoading).isTrue()   // ③ (count=0, isLoading=true)
+
+        val done = awaitItem()                       // ④ after delay(1000)
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(1)          // count=0+1=1
+    }
+}
+```
 
 ---
 
@@ -491,6 +645,51 @@ Virtual time advances to T+x → incrementAsync resumes → fires update ②
 |---|---|---|
 | `yield()` | ❌ | ❌ — reshuffles queue, order not guaranteed |
 | `delay()` | ✅ | ✅ — parks incrementAsync, relay has exclusive window |
+
+### Test Code
+
+> ⚠️ **Requires ViewModel change** — add `delay(1)` between each update in `incrementAsync`:
+> ```kotlin
+> fun incrementAsync() {
+>     viewModelScope.launch {
+>         _uiState.update { it.copy(isLoading = true) }
+>         delay(1)   // ← hard temporal barrier — relay gets exclusive window
+>         _uiState.update { it.copy(isLoading = false) }
+>         delay(1)   // ← hard temporal barrier
+>         _uiState.update { it.copy(isLoading = true) }
+>         delay(1000)
+>         _uiState.update { it.copy(count = it.count + 1, isLoading = false) }
+>     }
+> }
+> ```
+> `delay(1.seconds)` should also be active in `loadInitialCounter()`.
+
+```kotlin
+@Test
+fun `Case 5 - delay between updates - all 5 observed despite stateIn relay`() = runTest {
+    // sharingDispatcher can be Standard or Unconfined here — the delay() calls are the real fix.
+    // Each delay() removes incrementAsync from the runnable queue, giving the relay an exclusive
+    // window to forward the current _uiState value before the next update fires.
+    val viewModel = CounterViewModel(
+        sharingDispatcher = StandardTestDispatcher(mainDispatcherExtension.testDispatcher.scheduler)
+    )
+
+    viewModel.uiState.test {
+        assertThat(awaitItem()).isEqualTo(CounterUiState()) // initial (count=0, isLoading=false)
+
+        viewModel.incrementAsync()
+
+        // Each delay(1) in incrementAsync parks it, relay drains, then incrementAsync resumes.
+        assertThat(awaitItem().isLoading).isTrue()   // ① (count=0, isLoading=true)
+        assertThat(awaitItem().isLoading).isFalse()  // ② (count=0, isLoading=false)
+        assertThat(awaitItem().isLoading).isTrue()   // ③ (count=0, isLoading=true)
+
+        val done = awaitItem()                       // ④ after delay(1000)
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(1)          // count=0+1=1
+    }
+}
+```
 
 ---
 
@@ -686,6 +885,43 @@ The root reason for the divergence:
 |---|---|---|
 | Has `delay` | ❌ No — parked in `onStart` | ❌ Irrelevant — relay wasn't listening |
 | No `delay` | ✅ Yes — subscribed synchronously at T=0 | ✅ Yes — winning/losing combo applies |
+
+### Test Code
+
+> **Requires:** `delay(1.seconds)` active (uncommented) in `loadInitialCounter()`.
+> `sharingDispatcher` must be `UnconfinedTestDispatcher` with shared scheduler (current default in test setup).
+
+```kotlin
+@Test
+fun `Case 6 - onStart delay - 3 emissions, count offset by onStart mutation`() = runTest {
+    // Relay parks inside onStart's delay(1.seconds) → has NOT subscribed to _uiState yet.
+    // incrementAsync fires at T=0; ①②③ write into _uiState but the relay is not listening.
+    // At T=1s: onStart's increment() runs (count 0→1), relay subscribes, reads the snapshot
+    // (count=1, isLoading=true — isLoading=true is the residue of ③ still in _uiState).
+    // incrementAsync's ④ then fires: count = 1+1 = 2, NOT 0+1 = 1.
+    val viewModel = CounterViewModel(
+        sharingDispatcher = UnconfinedTestDispatcher(mainDispatcherExtension.testDispatcher.scheduler)
+    )
+
+    viewModel.uiState.test {
+        val initial = awaitItem()
+        assertThat(initial.count).isEqualTo(0)    // stateIn's static initialValue — captured at construction
+        assertThat(initial.isLoading).isFalse()
+
+        viewModel.incrementAsync()               // ①②③ fire into a relay that hasn't subscribed yet
+
+        // T=1s: onStart resumes → increment() runs → relay subscribes → reads snapshot
+        val loading = awaitItem()
+        assertThat(loading.count).isEqualTo(1)   // count=1: onStart's increment() already ran
+        assertThat(loading.isLoading).isTrue()   // isLoading=true: ③'s residue in _uiState at subscription time
+
+        // ④: count = it.count + 1 = 1 + 1 = 2 (NOT 0+1) because onStart already incremented count
+        val done = awaitItem()
+        assertThat(done.isLoading).isFalse()
+        assertThat(done.count).isEqualTo(2)
+    }
+}
+```
 
 ---
 
